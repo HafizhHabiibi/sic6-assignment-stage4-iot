@@ -7,6 +7,7 @@
 #include <NTPClient.h>       // Untuk mendapatkan waktu dari internet
 #include <WiFiUdp.h>         // Untuk membantu NTP
 #include <ESP32Servo.h>      // Untuk mengendalikan motor servo
+#include <Preferences.h>     // EEPROM Preferences
 
 // ===== KONFIGURASI =====
 const char* ssid = "OOO";             // Nama WiFi
@@ -30,6 +31,9 @@ Servo servo;                           // Buat objek motor servo
 // Objek untuk ambil waktu internet
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // UTC +7 WIB
+
+// objek preferences
+Preferences preferences;
 
 // ===== STRUKTUR DATA UNTUK JADWAL =====
 struct Jadwal {
@@ -145,26 +149,31 @@ void tarikJadwalPakan() {
 
       if (!error) {
         JsonArray arr = doc.as<JsonArray>();
-        jumlahJadwal = 0;
+        Jadwal tempJadwal[10];
+        int tempJumlah = 0;
+
         for (JsonObject obj : arr) {
-          if (jumlahJadwal < 10) {
-            jadwalList[jumlahJadwal].jam = obj["jam"];
-            jadwalList[jumlahJadwal].menit = obj["menit"];
-
-             // === Tambahkan print di sini ===
-            Serial.print("Jadwal ke-");
-            Serial.print(jumlahJadwal);
-            Serial.print(": ");
-            Serial.print(jadwalList[jumlahJadwal].jam);
-            Serial.print(":");
-            Serial.println(jadwalList[jumlahJadwal].menit);
-            // ==============================
-
-            jumlahJadwal++;
+          if (tempJumlah < 10) {
+            tempJadwal[tempJumlah].jam = obj["jam"];
+            tempJadwal[tempJumlah].menit = obj["menit"];
+            tempJumlah++;
           }
         }
-        Serial.println("Jadwal diperbarui.");
+
+        if (isJadwalBerubah(tempJadwal, tempJumlah)) {
+          // Kalau jadwal berubah, update jadwalList dan simpan EEPROM
+          jumlahJadwal = tempJumlah;
+          for (int i = 0; i < tempJumlah; i++) {
+            jadwalList[i] = tempJadwal[i];
+          }
+          simpanJadwalEEPROM();
+          Serial.println("[INFO] Jadwal diperbarui dan disimpan ke EEPROM.");
+        } else {
+          Serial.println("[INFO] Jadwal dari API sama, tidak perlu simpan ulang.");
+        }
       }
+    } else {
+      Serial.println("[ERROR] Gagal tarik jadwal. HTTP Response: " + String(httpResponseCode));
     }
     http.end();
   }
@@ -179,6 +188,83 @@ bool cekJadwal(int jam, int menit) {
   }
   return false;
 }
+
+// 10. Fungsi simpan jadwal ke EEPROM
+void simpanJadwalEEPROM() {
+  preferences.begin("jadwal", false); // buka namespace "jadwal", mode read+write
+  
+  preferences.putInt("jumlah", jumlahJadwal); // Simpan jumlah jadwal
+
+  // Simpan semua jadwal
+  for (int i = 0; i < jumlahJadwal; i++) {
+    String keyJam = "jam" + String(i);
+    String keyMenit = "menit" + String(i);
+
+    preferences.putInt(keyJam.c_str(), jadwalList[i].jam);
+    preferences.putInt(keyMenit.c_str(), jadwalList[i].menit);
+  }
+
+  preferences.end(); // Tutup akses ke EEPROM
+  Serial.println("Jadwal berhasil disimpan ke EEPROM.");
+}
+
+// 11. Fungsi load jadwal dari EEPROM
+void loadJadwalEEPROM() {
+  preferences.begin("jadwal", true); // buka namespace "jadwal", mode read-only
+
+  jumlahJadwal = preferences.getInt("jumlah", 0); // Baca jumlah jadwal
+
+  for (int i = 0; i < jumlahJadwal; i++) {
+    String keyJam = "jam" + String(i);
+    String keyMenit = "menit" + String(i);
+
+    jadwalList[i].jam = preferences.getInt(keyJam.c_str(), 0);
+    jadwalList[i].menit = preferences.getInt(keyMenit.c_str(), 0);
+  }
+
+  preferences.end(); // Tutup akses ke EEPROM
+  Serial.println("Jadwal berhasil dimuat dari EEPROM.");
+}
+
+// 12. Fungsi cek jadwal EEPROM apakah sama dengan API
+bool isJadwalBerubah(Jadwal* jadwalBaru, int jumlahBaru) {
+  if (jumlahBaru != jumlahJadwal) {
+    return true; // Kalau jumlah beda, pasti berubah
+  }
+
+  for (int i = 0; i < jumlahBaru; i++) {
+    if (jadwalList[i].jam != jadwalBaru[i].jam || jadwalList[i].menit != jadwalBaru[i].menit) {
+      return true; // Kalau ada yang beda, jadwal berubah
+    }
+  }
+  
+  return false; // Semua sama
+}
+
+// 13. Funngsi cek WIFI RECCONECT
+void cekWifi() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WARNING] WiFi terputus! Mencoba reconnect...");
+
+    WiFi.disconnect(); // Pastikan reset koneksi
+    WiFi.begin(ssid, password);
+
+    unsigned long startAttemptTime = millis();
+
+    // Coba konek maksimal 10 detik
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n[INFO] WiFi reconnect berhasil!");
+    } else {
+      Serial.println("\n[ERROR] Gagal reconnect WiFi setelah 10 detik.");
+    }
+  }
+}
+
 
 // ===== SETUP =====
 void setup() {
@@ -196,11 +282,15 @@ void setup() {
   timeClient.begin(); // Mulai NTP Client
   timeClient.update(); // Sinkronisasi jam pertama kali
 
+  loadJadwalEEPROM(); // Cek jadwal di EEPROM
   tarikJadwalPakan(); // Tarik jadwal awal
 }
 
 // ===== LOOP =====
 void loop() {
+
+  cekWifi(); // Cek WIFI terhubung atau tidak
+
   timeClient.update(); // Update jam internet
   int jam = timeClient.getHours();
   int menit = timeClient.getMinutes();
@@ -233,7 +323,7 @@ void loop() {
   }
 
   // 3. Tarik ulang jadwal pakan tiap 1 menit
-  if (now - lastTarikJadwal > 10000) {
+  if (now - lastTarikJadwal > 60000) {
     tarikJadwalPakan();
     lastTarikJadwal = now;
   }
